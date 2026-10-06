@@ -2,7 +2,7 @@ set_xmakever('3.0.1')
 includes('lib/commonlibsse-ng')
 
 set_project('ComboStagger')
-set_version('1.1.0')
+set_version('1.1.1')
 set_license('GPL-3.0')
 
 set_languages('c++23')
@@ -49,7 +49,7 @@ target('ComboStagger')
     add_rules('commonlibsse-ng.plugin', {
         name        = 'ComboStagger',
         author      = 'Mebeingocre',
-        description = 'Cleanup',
+        description = 'Adding timer option',
         runtime     = runtime
     })
 
