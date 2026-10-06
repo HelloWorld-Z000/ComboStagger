@@ -41,19 +41,22 @@ enum class CreatureTier {
 struct StaggerProfile {
     int hitBuffer = 0;
     int maxStaggers = 3;
+    int staggerWindowSeconds = 5;
     int cooldownSeconds = 10;
     float staggerMagnitude = 0.5f;
 
     void Save(const wchar_t* iniPath, const std::wstring& section) const {
         WritePrivateProfileStringW(section.c_str(), L"uHitBuffer", std::to_wstring(hitBuffer).c_str(), iniPath);
         WritePrivateProfileStringW(section.c_str(), L"uMaxStaggers", std::to_wstring(maxStaggers).c_str(), iniPath);
+        WritePrivateProfileStringW(section.c_str(), L"uStaggerWindowSeconds", std::to_wstring(staggerWindowSeconds).c_str(), iniPath);
         WritePrivateProfileStringW(section.c_str(), L"uCooldownSeconds", std::to_wstring(cooldownSeconds).c_str(), iniPath);
         WritePrivateProfileStringW(section.c_str(), L"fStaggerMagnitude", std::to_wstring(staggerMagnitude).c_str(), iniPath);
     }
 
-    void Load(const wchar_t* iniPath, const std::wstring& section, int defBuffer, int defMaxStags, int defCd, float defMag) {
+    void Load(const wchar_t* iniPath, const std::wstring& section, int defBuffer, int defMaxStags, int defWindow, int defCd, float defMag) {
         hitBuffer = GetPrivateProfileIntW(section.c_str(), L"uHitBuffer", defBuffer, iniPath);
         maxStaggers = GetPrivateProfileIntW(section.c_str(), L"uMaxStaggers", defMaxStags, iniPath);
+        staggerWindowSeconds = GetPrivateProfileIntW(section.c_str(), L"uStaggerWindowSeconds", defWindow, iniPath);
         cooldownSeconds = GetPrivateProfileIntW(section.c_str(), L"uCooldownSeconds", defCd, iniPath);
 
         wchar_t magBuffer[32];
@@ -168,6 +171,7 @@ struct Settings {
 
     bool enabled = true;
     bool enableTrueHUD = true;
+    bool useStaggerTimerMode = false;
     float blockMitigationPercent = 0.80f;
 
     // Player Settings
@@ -205,21 +209,22 @@ struct Settings {
     void ResetToDefaults() {
         enabled = true;
         enableTrueHUD = true;
+        useStaggerTimerMode = false;
         blockMitigationPercent = 0.80f;
 
         playerEnabled = true;
         playerComboDecaySeconds = 15;
         playerInstantBreakThreshold = 0.50f;
-        playerNone = { 3, 6, 10, 0.60f };
-        playerLight = { 6, 5, 12, 0.50f };
-        playerHeavy = { 8, 4, 12, 0.25f };
+        playerNone = { 3, 6, 5, 10, 0.60f };
+        playerLight = { 6, 5, 5, 12, 0.50f };
+        playerHeavy = { 8, 4, 5, 12, 0.25f };
 
         npcEnabled = true;
         npcComboDecaySeconds = 15;
         npcInstantBreakThreshold = 0.50f;
-        npcNone = { 3, 7, 10, 1.00f };
-        npcLight = { 6, 6, 12, 1.00f };
-        npcHeavy = { 8, 5, 21, 1.00f };
+        npcNone = { 3, 7, 5, 10, 1.00f };
+        npcLight = { 6, 6, 5, 12, 1.00f };
+        npcHeavy = { 8, 5, 5, 21, 1.00f };
 
         creatureEnabled = true;
         creatureInstantBreakThreshold = 0.50f;
@@ -228,10 +233,10 @@ struct Settings {
         creatureHeavyDecaySeconds = 15;
         creatureColossalDecaySeconds = 20;
 
-        creaturePrey = { 3, 3, 8, 0.75f };
-        creatureMedium = { 7, 5, 12, 0.55f };
-        creatureHeavy = { 10, 5, 12, 0.35f };
-        creatureColossal = { 16, 8, 18, 0.10f };
+        creaturePrey = { 3, 3, 5, 8, 0.75f };
+        creatureMedium = { 7, 5, 5, 12, 0.55f };
+        creatureHeavy = { 10, 5, 5, 12, 0.35f };
+        creatureColossal = { 16, 8, 5, 18, 0.10f };
 
         creatureAttacks.prey = 1.00f;
         creatureAttacks.medium = 1.50f;
@@ -261,6 +266,7 @@ struct Settings {
 
         WritePrivateProfileStringW(L"General", L"bEnabled", enabled ? L"1" : L"0", iniPath);
         WritePrivateProfileStringW(L"General", L"bEnableTrueHUD", enableTrueHUD ? L"1" : L"0", iniPath);
+        WritePrivateProfileStringW(L"General", L"bUseStaggerTimerMode", useStaggerTimerMode ? L"1" : L"0", iniPath);
         WritePrivateProfileStringW(L"General", L"fBlockMitigationPercent", std::to_wstring(blockMitigationPercent).c_str(), iniPath);
 
         WritePrivateProfileStringW(L"Player_General", L"bEnabled", playerEnabled ? L"1" : L"0", iniPath);
@@ -298,6 +304,7 @@ struct Settings {
 
         enabled = GetPrivateProfileIntW(L"General", L"bEnabled", 1, iniPath) != 0;
         enableTrueHUD = GetPrivateProfileIntW(L"General", L"bEnableTrueHUD", 1, iniPath) != 0;
+        useStaggerTimerMode = GetPrivateProfileIntW(L"General", L"bUseStaggerTimerMode", 0, iniPath) != 0;
 
         wchar_t blkBuf[32];
         GetPrivateProfileStringW(L"General", L"fBlockMitigationPercent", L"0.800000", blkBuf, 32, iniPath);
@@ -309,9 +316,9 @@ struct Settings {
         playerInstantBreakThreshold = std::wcstof(pThreshBuf, nullptr);
         playerComboDecaySeconds = GetPrivateProfileIntW(L"Player_General", L"uComboDecaySeconds", 15, iniPath);
 
-        playerNone.Load(iniPath, L"Player_Unarmored", 3, 6, 10, 0.60f);
-        playerLight.Load(iniPath, L"Player_LightArmor", 6, 5, 12, 0.50f);
-        playerHeavy.Load(iniPath, L"Player_HeavyArmor", 8, 4, 12, 0.25f);
+        playerNone.Load(iniPath, L"Player_Unarmored", 3, 6, 5, 10, 0.60f);
+        playerLight.Load(iniPath, L"Player_LightArmor", 6, 5, 5, 12, 0.50f);
+        playerHeavy.Load(iniPath, L"Player_HeavyArmor", 8, 4, 5, 12, 0.25f);
 
         npcEnabled = GetPrivateProfileIntW(L"NPC_General", L"bEnabled", 1, iniPath) != 0;
         wchar_t npcThreshBuf[32];
@@ -319,9 +326,9 @@ struct Settings {
         npcInstantBreakThreshold = std::wcstof(npcThreshBuf, nullptr);
         npcComboDecaySeconds = GetPrivateProfileIntW(L"NPC_General", L"uComboDecaySeconds", 15, iniPath);
 
-        npcNone.Load(iniPath, L"NPC_Unarmored", 3, 7, 10, 1.00f);
-        npcLight.Load(iniPath, L"NPC_LightArmor", 6, 6, 12, 1.00f);
-        npcHeavy.Load(iniPath, L"NPC_HeavyArmor", 8, 5, 21, 1.00f);
+        npcNone.Load(iniPath, L"NPC_Unarmored", 3, 7, 5, 10, 1.00f);
+        npcLight.Load(iniPath, L"NPC_LightArmor", 6, 6, 5, 12, 1.00f);
+        npcHeavy.Load(iniPath, L"NPC_HeavyArmor", 8, 5, 5, 21, 1.00f);
 
         creatureEnabled = GetPrivateProfileIntW(L"Creatures_General", L"bEnabled", 1, iniPath) != 0;
         wchar_t cThreshBuf[32];
@@ -333,10 +340,10 @@ struct Settings {
         creatureHeavyDecaySeconds = GetPrivateProfileIntW(L"Creatures_General", L"uHeavyDecaySeconds", 15, iniPath);
         creatureColossalDecaySeconds = GetPrivateProfileIntW(L"Creatures_General", L"uColossalDecaySeconds", 20, iniPath);
 
-        creaturePrey.Load(iniPath, L"Creatures_PreyAndSmall", 3, 3, 8, 0.75f);
-        creatureMedium.Load(iniPath, L"Creatures_MediumMonsters", 7, 5, 12, 0.55f);
-        creatureHeavy.Load(iniPath, L"Creatures_HeavyBeasts", 10, 5, 12, 0.35f);
-        creatureColossal.Load(iniPath, L"Creatures_ColossalBosses", 16, 8, 18, 0.10f);
+        creaturePrey.Load(iniPath, L"Creatures_PreyAndSmall", 3, 3, 5, 8, 0.75f);
+        creatureMedium.Load(iniPath, L"Creatures_MediumMonsters", 7, 5, 5, 12, 0.55f);
+        creatureHeavy.Load(iniPath, L"Creatures_HeavyBeasts", 10, 5, 5, 12, 0.35f);
+        creatureColossal.Load(iniPath, L"Creatures_ColossalBosses", 16, 8, 5, 18, 0.10f);
         creatureAttacks.Load(iniPath);
 
         multipliers.Load(iniPath);
@@ -900,6 +907,7 @@ public:
     struct StaggerState {
         float bufferHits = 0.0f;
         int staggerCount = 0;
+        std::chrono::steady_clock::time_point staggerWindowEnd{};
         std::chrono::steady_clock::time_point lastHitTime{};
         std::chrono::steady_clock::time_point cooldownStart{};
         std::chrono::steady_clock::time_point cooldownEnd{};
@@ -915,6 +923,7 @@ public:
                 lastHitTime = std::chrono::steady_clock::time_point{};
                 bufferHits = 0.0f;
                 staggerCount = 0;
+                staggerWindowEnd = std::chrono::steady_clock::time_point{};
                 return;
             }
 
@@ -928,6 +937,7 @@ public:
             if (elapsedMs >= decayTotalMs) {
                 bufferHits = 0.0f;
                 staggerCount = 0;
+                staggerWindowEnd = std::chrono::steady_clock::time_point{};
                 lastHitTime = std::chrono::steady_clock::time_point{};
             }
         }
@@ -1040,7 +1050,7 @@ public:
             }
         }
 
-        bool isStaggerVulnerable = (it->second.bufferHits >= maxF || it->second.staggerCount > 0);
+        bool isStaggerVulnerable = (it->second.bufferHits >= maxF || it->second.staggerCount > 0 || (it->second.staggerWindowEnd != std::chrono::steady_clock::time_point{} && now < it->second.staggerWindowEnd));
 
         if (visualDisplayValue >= maxF) {
             if (it->second.phantomOverridden && g_trueHUD) {
@@ -1065,6 +1075,7 @@ public:
     bool ProcessHit(RE::Actor* victim, const StaggerProfile& profile, int decaySeconds, float bufferDamage) {
         if (!victim || bufferDamage <= 0.0f) return false;
         RE::FormID formID = GetCanonicalFormID(victim);
+        auto* settings = Settings::GetSingleton();
 
         std::unique_lock lock(mutex);
         auto& state = trackerMap[formID];
@@ -1075,29 +1086,55 @@ public:
         }
 
         state.UpdateDecay(now, decaySeconds);
-
         state.lastHitTime = now;
         state.phantomOverridden = false;
 
         float maxBuf = static_cast<float>(profile.hitBuffer);
-        if (state.bufferHits < maxBuf) {
+
+        if (settings->useStaggerTimerMode) {
+            bool isInStaggerWindow = (state.staggerWindowEnd != std::chrono::steady_clock::time_point{} && now < state.staggerWindowEnd);
+
+            if (state.staggerWindowEnd != std::chrono::steady_clock::time_point{} && now >= state.staggerWindowEnd) {
+                state.staggerWindowEnd = std::chrono::steady_clock::time_point{};
+                state.bufferHits = 0.0f;
+                state.cooldownStart = now;
+                state.cooldownEnd = now + std::chrono::seconds(profile.cooldownSeconds);
+                return false;
+            }
+
+            if (isInStaggerWindow) {
+                state.bufferHits = maxBuf;
+                return true;
+            }
+
             state.bufferHits += bufferDamage;
             if (state.bufferHits < maxBuf) {
                 return false;
             }
+
+            state.bufferHits = maxBuf;
+            state.staggerWindowEnd = now + std::chrono::seconds(profile.staggerWindowSeconds);
+            return true;
+        } else {
+            if (state.bufferHits < maxBuf) {
+                state.bufferHits += bufferDamage;
+                if (state.bufferHits < maxBuf) {
+                    return false;
+                }
+            }
+
+            state.staggerCount++;
+
+            if (state.staggerCount >= profile.maxStaggers) {
+                state.bufferHits = 0.0f;
+                state.staggerCount = 0;
+                state.cooldownStart = now;
+                state.cooldownEnd = now + std::chrono::seconds(profile.cooldownSeconds);
+                state.lastHitTime = std::chrono::steady_clock::time_point{};
+            }
+
+            return true;
         }
-
-        state.staggerCount++;
-
-        if (state.staggerCount >= profile.maxStaggers) {
-            state.bufferHits = 0.0f;
-            state.staggerCount = 0;
-            state.cooldownStart = now;
-            state.cooldownEnd = now + std::chrono::seconds(profile.cooldownSeconds);
-            state.lastHitTime = std::chrono::steady_clock::time_point{};
-        }
-
-        return true;
     }
 
 private:
@@ -1330,14 +1367,24 @@ public:
 void RenderProfileSliders(const char* labelPrefix, StaggerProfile& profile, Settings* settings) {
     std::string bufLabel = std::string("Hit Buffer##") + labelPrefix;
     std::string stagLabel = std::string("Max Staggers##") + labelPrefix;
+    std::string windowLabel = std::string("Stagger Window (Sec)##") + labelPrefix;
     std::string cdLabel = std::string("Cooldown (Sec)##") + labelPrefix;
     std::string magLabel = std::string("Stagger Magnitude##") + labelPrefix;
 
     if (ImGui::SliderInt(bufLabel.c_str(), &profile.hitBuffer, 0, 60)) {
         settings->Save();
     }
-    if (ImGui::SliderInt(stagLabel.c_str(), &profile.maxStaggers, 1, 10)) {
-        settings->Save();
+    if (settings->useStaggerTimerMode) {
+        if (ImGui::SliderInt(windowLabel.c_str(), &profile.staggerWindowSeconds, 1, 30)) {
+            settings->Save();
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Duration of the active staggerable window once the hit buffer is broken.");
+        }
+    } else {
+        if (ImGui::SliderInt(stagLabel.c_str(), &profile.maxStaggers, 1, 10)) {
+            settings->Save();
+        }
     }
     if (ImGui::SliderInt(cdLabel.c_str(), &profile.cooldownSeconds, 1, 60)) {
         settings->Save();
@@ -1355,6 +1402,17 @@ void __stdcall RenderGeneralMenu() {
 
     if (ImGui::Checkbox("Master Enable", &settings->enabled)) {
         settings->Save();
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Text("Stagger Mode Selection");
+
+    if (ImGui::Checkbox("Use Staggerable Timer Mode (Instead of Stagger Count)", &settings->useStaggerTimerMode)) {
+        settings->Save();
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("When checked, breaking the hit buffer opens a timed window where subsequent hits instantly stagger until the window expires and triggers cooldown.");
     }
 
     ImGui::Spacing();
