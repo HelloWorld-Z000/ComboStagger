@@ -1,16 +1,21 @@
-#define NOMINMAX
+﻿#define NOMINMAX
 #define _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING
 #define _SILENCE_ALL_CXX17_DEPRECATION_WARNINGS
 
 #include "PCH.h"
 #include "SKSEMenuFramework.h"
 #include "TrueHUDAPI.h"
+#include <SKSE/Trampoline.h>
 #include <unordered_map>
 #include <chrono>
 #include <shared_mutex>
 #include <string>
 #include <algorithm>
 #include <cmath>
+#include <atomic>
+#include <RE/T/TESEquipEvent.h>
+#include <RE/T/TESObjectARMO.h>
+#include <RE/H/HitData.h>
 
 #ifdef max
 #undef max
@@ -23,7 +28,7 @@ namespace ImGui = ImGuiMCP;
 using ImVec4 = ImGuiMCP::ImVec4;
 
 static TRUEHUD_API::IVTrueHUD3* g_trueHUD = nullptr;
-static SKSE::PluginHandle g_pluginHandle = SKSE::kInvalidPluginHandle;
+static SKSE::PluginHandle g_pluginHandle = static_cast<SKSE::PluginHandle>(-1);
 
 enum class ArmorWeightClass {
     kNone = 0,
@@ -37,6 +42,13 @@ enum class CreatureTier {
     kHeavyBeast = 2,
     kColossalBoss = 3
 };
+
+static std::atomic<uint32_t> g_mainThreadId{ 0 };
+static std::shared_mutex g_armorCacheMutex;
+static std::unordered_map<RE::FormID, ArmorWeightClass> g_armorClassCache;
+
+static std::shared_mutex g_creatureTierMutex;
+static std::unordered_map<RE::FormID, CreatureTier> g_creatureTierCache;
 
 struct StaggerProfile {
     int hitBuffer = 0;
@@ -172,6 +184,8 @@ struct Settings {
     bool enabled = true;
     bool enableTrueHUD = true;
     bool useStaggerTimerMode = false;
+    bool disableAllVanillaStaggers = false;
+    bool disablePowerAttackStaggers = true;
     float blockMitigationPercent = 0.80f;
 
     // Player Settings
@@ -210,6 +224,8 @@ struct Settings {
         enabled = true;
         enableTrueHUD = true;
         useStaggerTimerMode = false;
+        disableAllVanillaStaggers = false;
+        disablePowerAttackStaggers = true;
         blockMitigationPercent = 0.80f;
 
         playerEnabled = true;
@@ -267,6 +283,8 @@ struct Settings {
         WritePrivateProfileStringW(L"General", L"bEnabled", enabled ? L"1" : L"0", iniPath);
         WritePrivateProfileStringW(L"General", L"bEnableTrueHUD", enableTrueHUD ? L"1" : L"0", iniPath);
         WritePrivateProfileStringW(L"General", L"bUseStaggerTimerMode", useStaggerTimerMode ? L"1" : L"0", iniPath);
+        WritePrivateProfileStringW(L"General", L"bDisableAllVanillaStaggers", disableAllVanillaStaggers ? L"1" : L"0", iniPath);
+        WritePrivateProfileStringW(L"General", L"bDisablePowerAttackStaggers", disablePowerAttackStaggers ? L"1" : L"0", iniPath);
         WritePrivateProfileStringW(L"General", L"fBlockMitigationPercent", std::to_wstring(blockMitigationPercent).c_str(), iniPath);
 
         WritePrivateProfileStringW(L"Player_General", L"bEnabled", playerEnabled ? L"1" : L"0", iniPath);
@@ -305,6 +323,8 @@ struct Settings {
         enabled = GetPrivateProfileIntW(L"General", L"bEnabled", 1, iniPath) != 0;
         enableTrueHUD = GetPrivateProfileIntW(L"General", L"bEnableTrueHUD", 1, iniPath) != 0;
         useStaggerTimerMode = GetPrivateProfileIntW(L"General", L"bUseStaggerTimerMode", 0, iniPath) != 0;
+        disableAllVanillaStaggers = GetPrivateProfileIntW(L"General", L"bDisableAllVanillaStaggers", 0, iniPath) != 0;
+        disablePowerAttackStaggers = GetPrivateProfileIntW(L"General", L"bDisablePowerAttackStaggers", 1, iniPath) != 0;
 
         wchar_t blkBuf[32];
         GetPrivateProfileStringW(L"General", L"fBlockMitigationPercent", L"0.800000", blkBuf, 32, iniPath);
@@ -350,6 +370,169 @@ struct Settings {
     }
 };
 
+inline thread_local bool g_bypassAllStaggerSuppression = false;
+
+extern "C" __declspec(dllexport) void ComboStagger_SetBypassStagger(bool a_bypass) {
+    g_bypassAllStaggerSuppression = a_bypass;
+}
+
+namespace StaggerHook {
+    using NotifyAnimationGraph_t = bool(*)(RE::IAnimationGraphManagerHolder*, const RE::BSFixedString&);
+    inline NotifyAnimationGraph_t _NotifyAnimationGraph_Character = nullptr;
+    inline NotifyAnimationGraph_t _NotifyAnimationGraph_Player = nullptr;
+
+    inline thread_local bool g_isCustomStagger = false;
+
+    struct CustomStaggerScope {
+        CustomStaggerScope() { g_isCustomStagger = true; }
+        ~CustomStaggerScope() { g_isCustomStagger = false; }
+    };
+
+    using IsParryStaggerActive_t = bool(*)();
+    inline bool IsMebeblockinParryActive() {
+        static IsParryStaggerActive_t s_fn = nullptr;
+        static bool s_initialized = false;
+        if (!s_initialized) {
+            if (auto hMod = GetModuleHandleA("Mebeblockin.dll")) {
+                s_fn = reinterpret_cast<IsParryStaggerActive_t>(GetProcAddress(hMod, "Mebeblockin_IsParryStaggerActive"));
+            }
+            s_initialized = true;
+        }
+        return s_fn ? s_fn() : false;
+    }
+
+    using IsActorInParryStagger_t = bool(*)(RE::FormID);
+    inline bool IsActorInMebeblockinParryStagger(RE::IAnimationGraphManagerHolder* a_this) {
+        static IsActorInParryStagger_t s_fn = nullptr;
+        static bool s_initialized = false;
+        if (!s_initialized) {
+            if (auto hMod = GetModuleHandleA("Mebeblockin.dll")) {
+                s_fn = reinterpret_cast<IsActorInParryStagger_t>(GetProcAddress(hMod, "Mebeblockin_IsActorInParryStagger"));
+            }
+            s_initialized = true;
+        }
+        if (!s_fn) return false;
+        if (auto* refr = dynamic_cast<RE::TESObjectREFR*>(a_this)) {
+            return s_fn(refr->GetFormID());
+        }
+        return false;
+    }
+
+    inline bool IsActorInMebeblockinParryStagger(RE::Actor* a_actor) {
+        if (!a_actor) return false;
+        static IsActorInParryStagger_t s_fn = nullptr;
+        static bool s_initialized = false;
+        if (!s_initialized) {
+            if (auto hMod = GetModuleHandleA("Mebeblockin.dll")) {
+                s_fn = reinterpret_cast<IsActorInParryStagger_t>(GetProcAddress(hMod, "Mebeblockin_IsActorInParryStagger"));
+            }
+            s_initialized = true;
+        }
+        return s_fn ? s_fn(a_actor->GetFormID()) : false;
+    }
+
+    inline bool IsStaggerEvent(const RE::BSFixedString& a_eventName) {
+        std::string_view name = a_eventName.data() ? a_eventName.data() : "";
+        if (name.empty()) return false;
+        if (name == "staggerStart" || name == "recoilStart" || name == "recoilLargeStart" ||
+            name == "largeRecoilStart" || name == "stagger") {
+            return true;
+        }
+        return (_stricmp(name.data(), "staggerstart") == 0 ||
+                _stricmp(name.data(), "recoilstart") == 0 ||
+                _stricmp(name.data(), "recoillargestart") == 0 ||
+                _stricmp(name.data(), "largerecoilstart") == 0 ||
+                _stricmp(name.data(), "stagger") == 0);
+    }
+
+    using ProcessHitData_t = void(*)(RE::Actor*, RE::HitData&);
+    inline REL::Relocation<ProcessHitData_t> _ProcessHitData;
+
+    inline void Hook_ProcessHitData(RE::Actor* a_victim, RE::HitData& a_hitData) {
+        if (!a_victim) {
+            if (_ProcessHitData) {
+                _ProcessHitData(a_victim, a_hitData);
+            }
+            return;
+        }
+
+        auto* settings = Settings::GetSingleton();
+        if (settings && settings->enabled) {
+            if (!g_bypassAllStaggerSuppression && !IsMebeblockinParryActive()) {
+                if (settings->disableAllVanillaStaggers) {
+                    a_hitData.stagger = 0.0f;
+                } else if (settings->disablePowerAttackStaggers) {
+                    if (a_hitData.flags.any(RE::HitData::Flag::kPowerAttack)) {
+                        a_hitData.stagger = 0.0f;
+                    }
+                }
+            }
+        }
+
+        if (_ProcessHitData) {
+            _ProcessHitData(a_victim, a_hitData);
+        }
+    }
+
+    inline bool ProcessGraphHook(RE::IAnimationGraphManagerHolder* a_this, const RE::BSFixedString& a_eventName) {
+        if (!a_this || a_eventName.empty()) return true;
+        auto* settings = Settings::GetSingleton();
+        if (!settings->enabled) return true;
+
+        if (g_isCustomStagger || g_bypassAllStaggerSuppression || IsMebeblockinParryActive()) {
+            return true;
+        }
+
+        // If this actor is currently reeling from an active parry stagger, block all normal vanilla staggers/recoils
+        // so that follow-up weapon hits do NOT interrupt or reset their parry stagger!
+        if (IsActorInMebeblockinParryStagger(a_this) && !g_isCustomStagger) {
+            if (IsStaggerEvent(a_eventName)) {
+                return false;
+            }
+        }
+        
+        if (settings->disableAllVanillaStaggers) {
+            if (IsStaggerEvent(a_eventName)) {
+                return false; 
+            }
+        }
+        return true;
+    }
+
+    inline bool Hook_NotifyAnimationGraph_Character(RE::IAnimationGraphManagerHolder* a_this, const RE::BSFixedString& a_eventName) {
+        if (!ProcessGraphHook(a_this, a_eventName)) return false;
+        return _NotifyAnimationGraph_Character(a_this, a_eventName);
+    }
+
+    inline bool Hook_NotifyAnimationGraph_Player(RE::IAnimationGraphManagerHolder* a_this, const RE::BSFixedString& a_eventName) {
+        if (!ProcessGraphHook(a_this, a_eventName)) return false;
+        return _NotifyAnimationGraph_Player(a_this, a_eventName);
+    }
+
+    inline void Install() {
+        static bool installed = false;
+        if (installed) return;
+        installed = true;
+
+        // In Skyrim SE/AE, IAnimationGraphManagerHolder is at VTABLE index 3 (index 4 is MagicTarget)
+        REL::Relocation<uintptr_t> charVTable(RE::VTABLE_Character[3]);
+        _NotifyAnimationGraph_Character = reinterpret_cast<NotifyAnimationGraph_t>(charVTable.write_vfunc(0x1, Hook_NotifyAnimationGraph_Character));
+        
+        REL::Relocation<uintptr_t> playerVTable(RE::VTABLE_PlayerCharacter[3]);
+        _NotifyAnimationGraph_Player = reinterpret_cast<NotifyAnimationGraph_t>(playerVTable.write_vfunc(0x1, Hook_NotifyAnimationGraph_Player));
+        
+        SKSE::log::info("Combo Stagger: Vanilla Stagger interception hooks successfully installed on VTABLE[3].");
+
+        // Hook ProcessHitData call-site at RELOCATION_ID(37673, 38627) + RELOCATION_OFFSET(0x3C0, 0x4A8)
+        {
+            REL::Relocation<uintptr_t> hitHook{ RELOCATION_ID(37673, 38627) };
+            auto& trampoline = SKSE::GetTrampoline();
+            _ProcessHitData = trampoline.write_call<5>(hitHook.address() + RELOCATION_OFFSET(0x3C0, 0x4A8), Hook_ProcessHitData);
+            SKSE::log::info("Combo Stagger: ProcessHitData hook installed for power attack stagger suppression.");
+        }
+    }
+}
+
 inline RE::FormID GetCanonicalFormID(RE::Actor* a_actor) {
     if (!a_actor) return 0;
     if (a_actor->IsPlayerRef() || (a_actor == RE::PlayerCharacter::GetSingleton())) {
@@ -363,7 +546,7 @@ bool HasKeywordOrName(RE::Actor* actor, const std::string& pattern) {
 
     if (actor->HasKeywordString(pattern)) return true;
 
-    auto* race = actor->GetRace();
+    auto* race = actor->GetActorBase() ? actor->GetActorBase()->GetRace() : nullptr;
     auto* base = actor->GetActorBase();
 
     if (race && race->HasKeywordString(pattern)) return true;
@@ -403,7 +586,7 @@ bool IsBeastForm(RE::Actor* actor) {
 
 bool IsCreature(RE::Actor* actor) {
     if (!actor) return false;
-    auto* race = actor->GetRace();
+    auto* race = actor->GetActorBase() ? actor->GetActorBase()->GetRace() : nullptr;
     if (!race) return false;
 
     if (race->HasKeywordString("ActorTypeNPC") || actor->HasKeywordString("ActorTypeNPC")) {
@@ -429,7 +612,7 @@ bool IsCreature(RE::Actor* actor) {
     return !isChild;
 }
 
-CreatureTier GetCreatureTier(RE::Actor* actor) {
+CreatureTier GetCreatureTierInternal(RE::Actor* actor) {
     if (!actor) return CreatureTier::kMedium;
 
     if (HasKeywordOrName(actor, "Dragon") ||
@@ -490,7 +673,26 @@ CreatureTier GetCreatureTier(RE::Actor* actor) {
     return CreatureTier::kMedium;
 }
 
-ArmorWeightClass GetActorArmorClass(RE::Actor* actor) {
+CreatureTier GetCreatureTier(RE::Actor* actor) {
+    if (!actor) return CreatureTier::kMedium;
+    RE::FormID formID = GetCanonicalFormID(actor);
+    {
+        std::shared_lock lock(g_creatureTierMutex);
+        auto it = g_creatureTierCache.find(formID);
+        if (it != g_creatureTierCache.end()) {
+            return it->second;
+        }
+    }
+
+    CreatureTier tier = GetCreatureTierInternal(actor);
+    {
+        std::unique_lock lock(g_creatureTierMutex);
+        g_creatureTierCache[formID] = tier;
+    }
+    return tier;
+}
+
+ArmorWeightClass CalculateActorArmorClassDirect(RE::Actor* actor) {
     if (!actor) return ArmorWeightClass::kNone;
 
     static const RE::BIPED_MODEL::BipedObjectSlot slots[] = {
@@ -523,6 +725,66 @@ ArmorWeightClass GetActorArmorClass(RE::Actor* actor) {
     }
 
     return ArmorWeightClass::kLight;
+}
+
+ArmorWeightClass GetOutfitArmorClass(RE::Actor* actor) {
+    if (!actor) return ArmorWeightClass::kNone;
+    auto* base = actor->GetActorBase();
+    if (!base) return ArmorWeightClass::kLight;
+
+    auto* outfit = base->defaultOutfit;
+    if (!outfit) return ArmorWeightClass::kNone;
+
+    int heavyCount = 0;
+    int lightCount = 0;
+
+    for (auto* item : outfit->outfitItems) {
+        if (!item) continue;
+        if (auto* armor = item->As<RE::TESObjectARMO>()) {
+            if (armor->IsHeavyArmor()) {
+                heavyCount++;
+            } else if (armor->IsLightArmor()) {
+                lightCount++;
+            }
+        }
+    }
+
+    if (heavyCount == 0 && lightCount == 0) return ArmorWeightClass::kNone;
+    if (heavyCount >= lightCount && heavyCount > 0) return ArmorWeightClass::kHeavy;
+    return ArmorWeightClass::kLight;
+}
+
+ArmorWeightClass GetActorArmorClass(RE::Actor* actor) {
+    if (!actor) return ArmorWeightClass::kNone;
+
+    RE::FormID formID = GetCanonicalFormID(actor);
+    bool isMainThread = (GetCurrentThreadId() == g_mainThreadId.load());
+
+    if (isMainThread) {
+        ArmorWeightClass cls = CalculateActorArmorClassDirect(actor);
+        {
+            std::unique_lock lock(g_armorCacheMutex);
+            g_armorClassCache[formID] = cls;
+        }
+        return cls;
+    }
+
+    // On background threads (Scaleform / TrueHUD / BSJobs), MUST NOT iterate actor inventory!
+    {
+        std::shared_lock lock(g_armorCacheMutex);
+        auto it = g_armorClassCache.find(formID);
+        if (it != g_armorClassCache.end()) {
+            return it->second;
+        }
+    }
+
+    // Fallback: safely inspect static default outfit record without touching dynamic inventory
+    ArmorWeightClass outfitCls = GetOutfitArmorClass(actor);
+    {
+        std::unique_lock lock(g_armorCacheMutex);
+        g_armorClassCache[formID] = outfitCls;
+    }
+    return outfitCls;
 }
 
 const StaggerProfile* ResolveActorProfile(RE::Actor* actor) {
@@ -897,6 +1159,26 @@ float GetHitBufferDamage(RE::Actor* aggressor, const RE::TESHitEvent* a_event) {
     return damage;
 }
 
+inline bool CanActorBeStaggered(RE::Actor* actor) {
+    if (!actor || actor->IsDead()) return false;
+    if (actor->IsInKillMove()) return false;
+    if (actor->IsOnMount() || actor->IsBeingRidden()) return false;
+
+    auto* aState = actor->AsActorState();
+    if (aState) {
+        if (aState->GetKnockState() != RE::KNOCK_STATE_ENUM::kNormal ||
+            aState->GetSitSleepState() != RE::SIT_SLEEP_STATE::kNormal) {
+            return false;
+        }
+    }
+
+    if (StaggerHook::IsActorInMebeblockinParryStagger(actor)) {
+        return false;
+    }
+
+    return true;
+}
+
 class ComboStaggerTracker {
 public:
     static ComboStaggerTracker* GetSingleton() {
@@ -919,7 +1201,9 @@ public:
         void UpdateDecay(const std::chrono::steady_clock::time_point& now, int decaySeconds) {
             if (now < cooldownEnd) return;
 
-            if (cooldownEnd != std::chrono::steady_clock::time_point{} && lastHitTime < cooldownEnd) {
+            if (cooldownEnd != std::chrono::steady_clock::time_point{} && now >= cooldownEnd) {
+                cooldownStart = std::chrono::steady_clock::time_point{};
+                cooldownEnd = std::chrono::steady_clock::time_point{};
                 lastHitTime = std::chrono::steady_clock::time_point{};
                 bufferHits = 0.0f;
                 staggerCount = 0;
@@ -944,8 +1228,18 @@ public:
     };
 
     void ResetAll() {
-        std::unique_lock lock(mutex);
-        trackerMap.clear();
+        {
+            std::unique_lock lock(mutex);
+            trackerMap.clear();
+        }
+        {
+            std::unique_lock lock(g_armorCacheMutex);
+            g_armorClassCache.clear();
+        }
+        {
+            std::unique_lock lock(g_creatureTierMutex);
+            g_creatureTierCache.clear();
+        }
     }
 
     void PruneStale() {
@@ -970,6 +1264,22 @@ public:
                 it = trackerMap.erase(it);
             } else {
                 ++it;
+            }
+        }
+
+        {
+            std::unique_lock aLock(g_armorCacheMutex);
+            if (g_armorClassCache.size() > 500) {
+                auto it = g_armorClassCache.find(0x14);
+                ArmorWeightClass pClass = (it != g_armorClassCache.end()) ? it->second : ArmorWeightClass::kNone;
+                g_armorClassCache.clear();
+                g_armorClassCache[0x14] = pClass;
+            }
+        }
+        {
+            std::unique_lock cLock(g_creatureTierMutex);
+            if (g_creatureTierCache.size() > 500) {
+                g_creatureTierCache.clear();
             }
         }
     }
@@ -1010,8 +1320,9 @@ public:
         return false;
     }
 
-    float GetDescendingBufferDisplay(RE::Actor* actor, int maxBuffer, int decaySeconds) {
-        if (!actor) return static_cast<float>(maxBuffer);
+    float GetDescendingBufferDisplay(RE::Actor* actor, const StaggerProfile& profile, int decaySeconds) {
+        int maxBuffer = profile.hitBuffer;
+        if (!actor || maxBuffer <= 0) return static_cast<float>(maxBuffer);
         RE::FormID formID = GetCanonicalFormID(actor);
 
         std::unique_lock lock(mutex);
@@ -1022,8 +1333,34 @@ public:
 
         auto now = std::chrono::steady_clock::now();
         float maxF = static_cast<float>(maxBuffer);
+        auto* settings = Settings::GetSingleton();
 
+        // 1. In Timer Mode, check if the stagger window has expired
+        if (settings->useStaggerTimerMode) {
+            if (it->second.staggerWindowEnd != std::chrono::steady_clock::time_point{} && now >= it->second.staggerWindowEnd) {
+                // Stagger window has ended! The target can no longer be staggered.
+                // Immediately transition to cooldown.
+                auto winEnd = it->second.staggerWindowEnd;
+                it->second.staggerWindowEnd = std::chrono::steady_clock::time_point{};
+                it->second.bufferHits = 0.0f;
+                it->second.staggerCount = 0;
+                it->second.lastHitTime = std::chrono::steady_clock::time_point{};
+                if (profile.cooldownSeconds > 0) {
+                    it->second.cooldownStart = winEnd;
+                    it->second.cooldownEnd = winEnd + std::chrono::seconds(profile.cooldownSeconds);
+                } else {
+                    it->second.cooldownStart = std::chrono::steady_clock::time_point{};
+                    it->second.cooldownEnd = std::chrono::steady_clock::time_point{};
+                }
+            }
+        }
+
+        // 2. Cooldown check: while on cooldown, target cannot be staggered and bar fills back up
         if (now < it->second.cooldownEnd) {
+            if (it->second.phantomOverridden && g_trueHUD) {
+                g_trueHUD->RevertSpecialBarColor(actor->GetHandle(), TRUEHUD_API::BarColorType::PhantomColor);
+                it->second.phantomOverridden = false;
+            }
             auto totalMs = std::chrono::duration_cast<std::chrono::milliseconds>(it->second.cooldownEnd - it->second.cooldownStart).count();
             if (totalMs > 0) {
                 auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - it->second.cooldownStart).count();
@@ -1033,24 +1370,42 @@ public:
             return 0.0f;
         }
 
+        // 3. Update decay if cooldown has passed
         it->second.UpdateDecay(now, decaySeconds);
 
         float staticRemaining = (std::clamp)(maxF - it->second.bufferHits, 0.0f, maxF);
 
         float visualDisplayValue = staticRemaining;
         if (decaySeconds > 0 && it->second.lastHitTime != std::chrono::steady_clock::time_point{} && it->second.bufferHits > 0.0f) {
-            auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - it->second.lastHitTime).count();
-            auto decayTotalMs = static_cast<int64_t>(decaySeconds * 1000);
+            bool isInStaggerWindow = (settings->useStaggerTimerMode &&
+                                      it->second.staggerWindowEnd != std::chrono::steady_clock::time_point{} &&
+                                      now < it->second.staggerWindowEnd);
+            if (!isInStaggerWindow) {
+                auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - it->second.lastHitTime).count();
+                auto decayTotalMs = static_cast<int64_t>(decaySeconds * 1000);
 
-            if (elapsedMs < decayTotalMs) {
-                float visualProgress = (std::clamp)(static_cast<float>(elapsedMs) / static_cast<float>(decayTotalMs), 0.0f, 1.0f);
-                visualDisplayValue = staticRemaining + (visualProgress * (maxF - staticRemaining));
-            } else {
-                visualDisplayValue = maxF;
+                if (elapsedMs < decayTotalMs) {
+                    float visualProgress = (std::clamp)(static_cast<float>(elapsedMs) / static_cast<float>(decayTotalMs), 0.0f, 1.0f);
+                    visualDisplayValue = staticRemaining + (visualProgress * (maxF - staticRemaining));
+                } else {
+                    visualDisplayValue = maxF;
+                }
             }
         }
 
-        bool isStaggerVulnerable = (it->second.bufferHits >= maxF || it->second.staggerCount > 0 || (it->second.staggerWindowEnd != std::chrono::steady_clock::time_point{} && now < it->second.staggerWindowEnd));
+        // 4. Stagger vulnerability check:
+        // Bar should only flash if the actor can actually be staggered right now
+        bool isStaggerVulnerable = false;
+        if (CanActorBeStaggered(actor)) {
+            if (settings->useStaggerTimerMode) {
+                isStaggerVulnerable = (it->second.staggerWindowEnd != std::chrono::steady_clock::time_point{} &&
+                                       now < it->second.staggerWindowEnd);
+            } else {
+                isStaggerVulnerable = (it->second.bufferHits >= maxF &&
+                                       it->second.staggerCount < profile.maxStaggers &&
+                                       visualDisplayValue <= 0.05f * maxF);
+            }
+        }
 
         if (visualDisplayValue >= maxF) {
             if (it->second.phantomOverridden && g_trueHUD) {
@@ -1059,8 +1414,9 @@ public:
             }
         }
 
+        // 5. Flash special bar only when actively vulnerable to stagger
         if (isStaggerVulnerable && visualDisplayValue < maxF) {
-            if (g_trueHUD && g_pluginHandle != SKSE::kInvalidPluginHandle) {
+            if (g_trueHUD && g_pluginHandle != static_cast<SKSE::PluginHandle>(-1)) {
                 auto flashElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - it->second.lastFlashTime).count();
                 if (flashElapsedMs >= 350) {
                     it->second.lastFlashTime = now;
@@ -1072,8 +1428,18 @@ public:
         return visualDisplayValue;
     }
 
+    float GetDescendingBufferDisplay(RE::Actor* actor, int maxBuffer, int decaySeconds) {
+        StaggerProfile fallbackProfile;
+        fallbackProfile.hitBuffer = maxBuffer;
+        fallbackProfile.cooldownSeconds = 10;
+        fallbackProfile.staggerWindowSeconds = 5;
+        fallbackProfile.maxStaggers = 3;
+        return GetDescendingBufferDisplay(actor, fallbackProfile, decaySeconds);
+    }
+
     bool ProcessHit(RE::Actor* victim, const StaggerProfile& profile, int decaySeconds, float bufferDamage) {
         if (!victim || bufferDamage <= 0.0f) return false;
+        if (!CanActorBeStaggered(victim)) return false;
         RE::FormID formID = GetCanonicalFormID(victim);
         auto* settings = Settings::GetSingleton();
 
@@ -1095,10 +1461,18 @@ public:
             bool isInStaggerWindow = (state.staggerWindowEnd != std::chrono::steady_clock::time_point{} && now < state.staggerWindowEnd);
 
             if (state.staggerWindowEnd != std::chrono::steady_clock::time_point{} && now >= state.staggerWindowEnd) {
+                auto winEnd = state.staggerWindowEnd;
                 state.staggerWindowEnd = std::chrono::steady_clock::time_point{};
                 state.bufferHits = 0.0f;
-                state.cooldownStart = now;
-                state.cooldownEnd = now + std::chrono::seconds(profile.cooldownSeconds);
+                state.staggerCount = 0;
+                state.lastHitTime = std::chrono::steady_clock::time_point{};
+                if (profile.cooldownSeconds > 0) {
+                    state.cooldownStart = winEnd;
+                    state.cooldownEnd = winEnd + std::chrono::seconds(profile.cooldownSeconds);
+                } else {
+                    state.cooldownStart = std::chrono::steady_clock::time_point{};
+                    state.cooldownEnd = std::chrono::steady_clock::time_point{};
+                }
                 return false;
             }
 
@@ -1158,7 +1532,7 @@ public:
                 TRUEHUD_API::RequestPluginAPI(TRUEHUD_API::InterfaceVersion::V3));
         }
 
-        if (g_trueHUD && g_pluginHandle != SKSE::kInvalidPluginHandle) {
+        if (g_trueHUD && g_pluginHandle != static_cast<SKSE::PluginHandle>(-1)) {
             auto result = g_trueHUD->RequestSpecialResourceBarsControl(g_pluginHandle);
 
             if (result == TRUEHUD_API::APIResult::OK || result == TRUEHUD_API::APIResult::AlreadyGiven) {
@@ -1172,7 +1546,7 @@ public:
 
                     int decay = ResolveActorDecaySeconds(a_actor);
                     return ComboStaggerTracker::GetSingleton()->GetDescendingBufferDisplay(
-                        a_actor, profile->hitBuffer, decay);
+                        a_actor, *profile, decay);
                 };
 
                 auto getMax = [](RE::Actor* a_actor) -> float {
@@ -1194,7 +1568,7 @@ public:
     }
 
     void FlashBar(RE::ActorHandle a_handle) {
-        if (g_trueHUD && a_handle && g_pluginHandle != SKSE::kInvalidPluginHandle) {
+        if (g_trueHUD && a_handle && g_pluginHandle != static_cast<SKSE::PluginHandle>(-1)) {
             g_trueHUD->FlashActorSpecialBar(g_pluginHandle, a_handle, false);
         }
     }
@@ -1204,16 +1578,7 @@ private:
 };
 
 void ApplyStagger(RE::Actor* victim, RE::Actor* aggressor, float magnitude) {
-    if (!victim || victim->IsDead()) return;
-    if (victim->IsOnMount() || victim->IsBeingRidden()) return;
-
-    auto* state = victim->AsActorState();
-    if (state) {
-        if (state->GetKnockState() != RE::KNOCK_STATE_ENUM::kNormal ||
-            state->GetSitSleepState() != RE::SIT_SLEEP_STATE::kNormal) {
-            return;
-        }
-    }
+    if (!CanActorBeStaggered(victim)) return;
 
     float staggerDir = 0.0f;
 
@@ -1237,8 +1602,35 @@ void ApplyStagger(RE::Actor* victim, RE::Actor* aggressor, float magnitude) {
 
     victim->SetGraphVariableFloat("staggerDirection", staggerDir);
     victim->SetGraphVariableFloat("staggerMagnitude", magnitude);
-    victim->NotifyAnimationGraph("staggerStart");
+    
+    {
+        StaggerHook::CustomStaggerScope scope;
+        victim->NotifyAnimationGraph("staggerStart");
+    }
 }
+
+class EquipEventHandler : public RE::BSTEventSink<RE::TESEquipEvent> {
+public:
+    static EquipEventHandler* GetSingleton() {
+        static EquipEventHandler instance;
+        return &instance;
+    }
+
+    RE::BSEventNotifyControl ProcessEvent(const RE::TESEquipEvent* a_event, RE::BSTEventSource<RE::TESEquipEvent>*) override {
+        if (!a_event || !a_event->actor) {
+            return RE::BSEventNotifyControl::kContinue;
+        }
+
+        if (auto* actor = a_event->actor->As<RE::Actor>()) {
+            RE::FormID formID = GetCanonicalFormID(actor);
+            ArmorWeightClass cls = CalculateActorArmorClassDirect(actor);
+            std::unique_lock lock(g_armorCacheMutex);
+            g_armorClassCache[formID] = cls;
+        }
+
+        return RE::BSEventNotifyControl::kContinue;
+    }
+};
 
 class HitEventHandler : public RE::BSTEventSink<RE::TESHitEvent> {
 public:
@@ -1414,6 +1806,22 @@ void __stdcall RenderGeneralMenu() {
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip("When checked, breaking the hit buffer opens a timed window where subsequent hits instantly stagger until the window expires and triggers cooldown.");
     }
+    
+    if (ImGui::Checkbox("Disable ALL Vanilla Staggers", &settings->disableAllVanillaStaggers)) {
+        if (settings->disableAllVanillaStaggers) settings->disablePowerAttackStaggers = false;
+        settings->Save();
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Hooks the engine to completely block Skyrim's native stagger events, making your hit buffer the ONLY way an actor can be staggered.");
+    }
+
+    if (ImGui::Checkbox("Disable ONLY Power Attack Staggers", &settings->disablePowerAttackStaggers)) {
+        if (settings->disablePowerAttackStaggers) settings->disableAllVanillaStaggers = false;
+        settings->Save();
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Reads power attack hit flags and cleanly suppresses native vanilla staggers from heavy attacks while feeding damage into your poise hit buffer.");
+    }
 
     ImGui::Spacing();
     ImGui::Separator();
@@ -1444,10 +1852,19 @@ void __stdcall RenderGeneralMenu() {
     ImGui::Separator();
     ImGui::Text("INI Configuration");
 
+    if (ImGui::Button("Save Current Settings to INI")) {
+        settings->Save();
+        SKSE::log::info("Combo Stagger: Current settings manually saved to INI!");
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Forces a manual save of all active configuration settings to the INI file. (Note: Sliders also auto-save when adjusted).");
+    }
+
+    ImGui::SameLine();
     if (ImGui::Button("Reset to Default Values")) {
         settings->ResetToDefaults();
         settings->Save();
-        RE::DebugNotification("Combo Stagger: Reset to original defaults and saved to INI!");
+        SKSE::log::info("Combo Stagger: Reset to original defaults and saved to INI!");
     }
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip("Restores hardcoded default values and overwrites the active INI file.");
@@ -1459,7 +1876,7 @@ void __stdcall RenderGeneralMenu() {
 
     if (ImGui::Button("Reset All Active Cooldowns & Trackers")) {
         ComboStaggerTracker::GetSingleton()->ResetAll();
-        RE::DebugNotification("Combo Stagger: All active cooldowns & buffers cleared!");
+        SKSE::log::info("Combo Stagger: All active cooldowns & buffers cleared!");
     }
 }
 
@@ -1736,7 +2153,7 @@ void __stdcall RenderWeaponMultipliersMenu() {
     bool openBash = ImGui::CollapsingHeader("Bashing & Shield Strikes", ImGuiMCP::ImGuiTreeNodeFlags_DefaultOpen);
     if (openBash) {
         if (ImGui::SliderFloat("Standard Bash", &m.bashMult, 0.1f, 10.0f, "%.2f")) settings->Save();
-        if (ImGui::SliderFloat("Power Bash", &m.powerBashMult, 0.1f, 10.0f, "%.2f")) settings->Save();
+        if (ImGui::SliderFloat("Power Attack Multiplier", &m.powerBashMult, 0.1f, 10.0f, "%.2f")) settings->Save();
     }
 
     ImGui::Spacing();
@@ -1749,23 +2166,29 @@ void __stdcall RenderWeaponMultipliersMenu() {
 }
 
 SKSEPluginLoad(const SKSE::LoadInterface* a_skse) {
-    SKSE::Init(a_skse);
+    SKSE::Init(a_skse, false);
+    SKSE::AllocTrampoline(128);
 
-    g_pluginHandle = a_skse->GetPluginHandle();
+    g_mainThreadId.store(GetCurrentThreadId());
+    g_pluginHandle = SKSE::GetPluginHandle();
+    
+    SKSE::log::info("{} v{} loading...", Plugin::NAME, Plugin::VERSION.string());
+
     Settings::GetSingleton()->Load();
 
     auto* messaging = SKSE::GetMessagingInterface();
     if (messaging) {
         messaging->RegisterListener([](SKSE::MessagingInterface::Message* a_msg) {
-            if (a_msg->type == SKSE::MessagingInterface::kPostLoad || 
-                a_msg->type == SKSE::MessagingInterface::kPostPostLoad) {
+            if (a_msg->type == SKSE::MessagingInterface::kPostLoad) {
+                StaggerHook::Install();
                 TrueHUDManager::GetSingleton()->Initialize();
             } else if (a_msg->type == SKSE::MessagingInterface::kDataLoaded) {
                 TrueHUDManager::GetSingleton()->Initialize();
 
-                auto* hitSource = RE::ScriptEventSourceHolder::GetSingleton();
-                if (hitSource) {
-                    hitSource->AddEventSink(HitEventHandler::GetSingleton());
+                auto* eventSourceHolder = RE::ScriptEventSourceHolder::GetSingleton();
+                if (eventSourceHolder) {
+                    eventSourceHolder->AddEventSink(HitEventHandler::GetSingleton());
+                    eventSourceHolder->AddEventSink(EquipEventHandler::GetSingleton());
                 }
 
                 SKSEMenuFramework::SetSection("Combo Stagger");
@@ -1778,6 +2201,11 @@ SKSEPluginLoad(const SKSE::LoadInterface* a_skse) {
             } else if (a_msg->type == SKSE::MessagingInterface::kPostLoadGame ||
                        a_msg->type == SKSE::MessagingInterface::kNewGame) {
                 ComboStaggerTracker::GetSingleton()->ResetAll();
+                if (auto* player = RE::PlayerCharacter::GetSingleton()) {
+                    ArmorWeightClass cls = CalculateActorArmorClassDirect(player);
+                    std::unique_lock lock(g_armorCacheMutex);
+                    g_armorClassCache[0x14] = cls;
+                }
             }
         });
     }
